@@ -711,9 +711,7 @@ export default function ProctoringPOCPage() {
           </section>
         </main>
 
-        <footer className="mt-6 text-center text-xs text-slate-200/60">
-          POC only — add privacy/consent UX before real use.
-        </footer>
+        
       </div>
     </div>
   );
