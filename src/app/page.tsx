@@ -51,9 +51,26 @@ export default function ProctoringPOCPage() {
   const [modelReady, setModelReady] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
 
-  const [log, setLog] = useState<Array<{ ts: number; text: string }>>([]);
+  const logIdRef = useRef(0);
+  const [log, setLog] = useState<Array<{ id: number; ts: number; text: string }>>([]);
   const pushLog = (text: string) =>
-    setLog((prev) => [{ ts: Date.now(), text }, ...prev].slice(0, 10));
+    setLog((prev) =>
+      [{ id: ++logIdRef.current, ts: Date.now(), text }, ...prev].slice(0, 10),
+    );
+
+  // UI state mirrors of the refs below — updated periodically so the UI repaints.
+  const [uiTelemetry, setUiTelemetry] = useState({
+    faceCount: 0,
+    isLookingAtScreen: true,
+    violationReason: null as string | null,
+    iris: { leftX: 0.5, rightX: 0.5, leftY: 0.5, rightY: 0.5 },
+    baseline: { leftX: 0.5, rightX: 0.5, leftY: 0.5, rightY: 0.5 },
+  });
+
+  const [thresholds, setThresholds] = useState({
+    horizontal: 0.18,
+    vertical: 0.22,
+  });
 
   // Calibration + attention
   const isCalibratingRef = useRef(false);
@@ -65,10 +82,9 @@ export default function ProctoringPOCPage() {
     rightY: 0.5,
   });
 
-  const thresholdsRef = useRef({
-    horizontal: 0.18,
-    vertical: 0.22,
-  });
+  const thresholdsRef = useRef(thresholds);
+  // Keep the ref in sync with state so the FaceMesh callback always reads the latest value.
+  thresholdsRef.current = thresholds;
 
   const calibrationSamplesRef = useRef({
     leftX: [] as number[],
@@ -114,18 +130,25 @@ export default function ProctoringPOCPage() {
     return blobToBase64(blob);
   };
 
-  const stopAll = () => {
+  const stoppedRef = useRef(false);
+
+  const teardownResources = () => {
+    stoppedRef.current = true;
+
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
 
-    if (detectTimerRef.current) window.clearInterval(detectTimerRef.current);
+    if (detectTimerRef.current) window.clearTimeout(detectTimerRef.current);
     detectTimerRef.current = null;
 
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
+  };
 
+  const stopAll = () => {
+    teardownResources();
     setCameraReady(false);
     setStatus("Stopped");
     pushLog("Stopped.");
@@ -149,7 +172,7 @@ export default function ProctoringPOCPage() {
 
     fm.setOptions({
       refineLandmarks: true, // REQUIRED for iris landmarks 468/473
-      maxNumFaces: 4,
+      maxNumFaces: 2,
       minDetectionConfidence: 0.5,
       minTrackingConfidence: 0.5,
     });
@@ -277,7 +300,8 @@ export default function ProctoringPOCPage() {
     video.srcObject = stream;
 
     await new Promise<void>((resolve) => {
-      video.onloadedmetadata = () => resolve();
+      if (video.readyState >= 1) return resolve();
+      video.addEventListener("loadedmetadata", () => resolve(), { once: true });
     });
 
     await video.play();
@@ -291,17 +315,24 @@ export default function ProctoringPOCPage() {
     if (video && fm && video.readyState >= 2) {
       try {
         await fm.send({ image: video });
-      } catch {}
+      } catch (e) {
+        console.error("FaceMesh send error", e);
+      }
     }
 
     rafRef.current = requestAnimationFrame(faceLoop);
   };
 
   const startDetectionLoop = () => {
-    detectTimerRef.current = window.setInterval(async () => {
+    const tick = async () => {
+      if (stoppedRef.current) return;
+
       const model = cocoRef.current;
       const video = videoRef.current;
-      if (!model || !video || video.readyState < 2) return;
+      if (!model || !video || video.readyState < 2) {
+        detectTimerRef.current = window.setTimeout(tick, DETECT_INTERVAL);
+        return;
+      }
 
       try {
         const preds = await model.detect(video);
@@ -314,7 +345,10 @@ export default function ProctoringPOCPage() {
           lastFaceInfoRef.current.faceCount !== 1;
 
         if (relevant.length > 0 || attentionIssue) {
-          const imageBase64 = await captureFrameBase64();
+          // Only build the base64 frame when there's a real forbidden-object hit;
+          // it's expensive and not used for plain attention events.
+          const imageBase64 =
+            relevant.length > 0 ? await captureFrameBase64() : null;
 
           const payload = {
             ts: Date.now(),
@@ -349,7 +383,13 @@ export default function ProctoringPOCPage() {
       } catch (e) {
         console.error("Detect error", e);
       }
-    }, DETECT_INTERVAL);
+
+      if (!stoppedRef.current) {
+        detectTimerRef.current = window.setTimeout(tick, DETECT_INTERVAL);
+      }
+    };
+
+    tick();
   };
 
   const startCalibration = () => {
@@ -366,6 +406,7 @@ export default function ProctoringPOCPage() {
 
   const start = async () => {
     try {
+      stoppedRef.current = false;
       setStatus("Loading models");
       cocoRef.current = await cocoSsd.load({ base: "lite_mobilenet_v2" });
       await setupFaceMesh();
@@ -388,8 +429,22 @@ export default function ProctoringPOCPage() {
 
   useEffect(() => {
     start();
-    return () => stopAll();
+    return () => teardownResources();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Pump the mutable refs into React state at ~5Hz so the telemetry panel repaints.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setUiTelemetry({
+        faceCount: lastFaceInfoRef.current.faceCount,
+        isLookingAtScreen: lastFaceInfoRef.current.isLookingAtScreen,
+        violationReason: lastFaceInfoRef.current.violationReason,
+        iris: { ...lastFaceInfoRef.current.iris },
+        baseline: { ...baselineRef.current },
+      });
+    }, 200);
+    return () => window.clearInterval(id);
   }, []);
 
   const badge = useMemo(() => {
@@ -401,8 +456,7 @@ export default function ProctoringPOCPage() {
   }, [status]);
 
   const attentionOk =
-    lastFaceInfoRef.current.faceCount === 1 &&
-    lastFaceInfoRef.current.isLookingAtScreen;
+    uiTelemetry.faceCount === 1 && uiTelemetry.isLookingAtScreen;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -460,7 +514,7 @@ export default function ProctoringPOCPage() {
               <div className="text-xs text-slate-300/80">
                 Face count:{" "}
                 <span className="font-bold text-slate-100">
-                  {lastFaceInfoRef.current.faceCount}
+                  {uiTelemetry.faceCount}
                 </span>
               </div>
             </div>
@@ -486,8 +540,7 @@ export default function ProctoringPOCPage() {
                 <span className="text-xs font-bold">
                   {attentionOk
                     ? "Attention OK"
-                    : (lastFaceInfoRef.current.violationReason ??
-                      "Attention issue")}
+                    : (uiTelemetry.violationReason ?? "Attention issue")}
                 </span>
               </div>
             </div>
@@ -523,16 +576,17 @@ export default function ProctoringPOCPage() {
                       min={0.08}
                       max={0.3}
                       step={0.01}
-                      defaultValue={thresholdsRef.current.horizontal}
+                      value={thresholds.horizontal}
                       onChange={(e) =>
-                        (thresholdsRef.current.horizontal = Number(
-                          e.target.value,
-                        ))
+                        setThresholds((t) => ({
+                          ...t,
+                          horizontal: Number(e.target.value),
+                        }))
                       }
                       className="w-full accent-indigo-400"
                     />
                     <span className="text-right tabular-nums text-slate-200/80">
-                      {thresholdsRef.current.horizontal.toFixed(2)}
+                      {thresholds.horizontal.toFixed(2)}
                     </span>
                   </label>
 
@@ -545,16 +599,17 @@ export default function ProctoringPOCPage() {
                       min={0.1}
                       max={0.35}
                       step={0.01}
-                      defaultValue={thresholdsRef.current.vertical}
+                      value={thresholds.vertical}
                       onChange={(e) =>
-                        (thresholdsRef.current.vertical = Number(
-                          e.target.value,
-                        ))
+                        setThresholds((t) => ({
+                          ...t,
+                          vertical: Number(e.target.value),
+                        }))
                       }
                       className="w-full accent-indigo-400"
                     />
                     <span className="text-right tabular-nums text-slate-200/80">
-                      {thresholdsRef.current.vertical.toFixed(2)}
+                      {thresholds.vertical.toFixed(2)}
                     </span>
                   </label>
                 </div>
@@ -572,7 +627,7 @@ export default function ProctoringPOCPage() {
                 <div className="mt-0.5 text-xs text-slate-300/80">
                   Looking:{" "}
                   <span className="font-bold text-slate-100">
-                    {lastFaceInfoRef.current.isLookingAtScreen ? "Yes" : "No"}
+                    {uiTelemetry.isLookingAtScreen ? "Yes" : "No"}
                   </span>
                 </div>
               </div>
@@ -587,8 +642,8 @@ export default function ProctoringPOCPage() {
                   Iris (L)
                 </div>
                 <div className="mt-1 text-xs font-bold tabular-nums text-slate-100">
-                  X {lastFaceInfoRef.current.iris.leftX.toFixed(2)} • Y{" "}
-                  {lastFaceInfoRef.current.iris.leftY.toFixed(2)}
+                  X {uiTelemetry.iris.leftX.toFixed(2)} • Y{" "}
+                  {uiTelemetry.iris.leftY.toFixed(2)}
                 </div>
               </div>
               <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
@@ -596,8 +651,8 @@ export default function ProctoringPOCPage() {
                   Iris (R)
                 </div>
                 <div className="mt-1 text-xs font-bold tabular-nums text-slate-100">
-                  X {lastFaceInfoRef.current.iris.rightX.toFixed(2)} • Y{" "}
-                  {lastFaceInfoRef.current.iris.rightY.toFixed(2)}
+                  X {uiTelemetry.iris.rightX.toFixed(2)} • Y{" "}
+                  {uiTelemetry.iris.rightY.toFixed(2)}
                 </div>
               </div>
               <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
@@ -605,8 +660,8 @@ export default function ProctoringPOCPage() {
                   Baseline (L)
                 </div>
                 <div className="mt-1 text-xs font-bold tabular-nums text-slate-100">
-                  X {baselineRef.current.leftX.toFixed(2)} • Y{" "}
-                  {baselineRef.current.leftY.toFixed(2)}
+                  X {uiTelemetry.baseline.leftX.toFixed(2)} • Y{" "}
+                  {uiTelemetry.baseline.leftY.toFixed(2)}
                 </div>
               </div>
               <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
@@ -614,8 +669,8 @@ export default function ProctoringPOCPage() {
                   Baseline (R)
                 </div>
                 <div className="mt-1 text-xs font-bold tabular-nums text-slate-100">
-                  X {baselineRef.current.rightX.toFixed(2)} • Y{" "}
-                  {baselineRef.current.rightY.toFixed(2)}
+                  X {uiTelemetry.baseline.rightX.toFixed(2)} • Y{" "}
+                  {uiTelemetry.baseline.rightY.toFixed(2)}
                 </div>
               </div>
             </div>
@@ -631,7 +686,7 @@ export default function ProctoringPOCPage() {
               ) : (
                 log.map((l) => (
                   <div
-                    key={l.ts}
+                    key={l.id}
                     className="flex gap-3 rounded-2xl border border-white/10 bg-black/20 p-3"
                   >
                     <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-indigo-400 shadow-[0_0_0_6px_rgba(99,102,241,0.12)]" />
